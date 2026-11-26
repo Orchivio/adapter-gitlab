@@ -234,6 +234,7 @@ func (c conn) notesSince(ctx context.Context, repo string, iid int64, since time
 			return all, nil
 		}
 	}
+	slog.Warn("GitLab note page cap reached, older notes skipped", "repo", repo, "merge_request", iid)
 	return all, nil
 }
 

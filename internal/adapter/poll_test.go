@@ -1,13 +1,16 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -279,5 +282,38 @@ func TestStreamWithoutCoveredRepoIsFailedPrecondition(t *testing.T) {
 
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("StreamEvents = %v; want FailedPrecondition", err)
+	}
+}
+
+func TestNotePageCapLogsRepoAndMR(t *testing.T) {
+	page := make([]string, pageSize)
+	for i := range page {
+		page[i] = humanNote(i+1, "secret body", recent)
+	}
+	var pages atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		fmt.Fprint(w, "["+strings.Join(page, ",")+"]")
+	}))
+	t.Cleanup(fake.Close)
+	s := newServer(t, fake.URL)
+	c, err := s.connectionFor([]*pb.Credential{groupCredential(t, "g", fakeToken)}, "g/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	notes, err := c.notesSince(t.Context(), "g/p", 7, fixedNow)
+
+	if err != nil || len(notes) != maxNotePage*pageSize || pages.Load() != maxNotePage {
+		t.Fatalf("err=%v notes=%d pages=%d", err, len(notes), pages.Load())
+	}
+	got := logs.String()
+	if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "repo=g/p") || !strings.Contains(got, "merge_request=7") ||
+		strings.Contains(got, "secret") || strings.Contains(got, fakeToken) {
+		t.Fatalf("log = %q", got)
 	}
 }
