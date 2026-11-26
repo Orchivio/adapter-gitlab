@@ -182,3 +182,68 @@ func TestFailedIssueRevokesCreatedTokens(t *testing.T) {
 		t.Fatalf("issue = %v, deletes %v", err, f.deletes())
 	}
 }
+
+// revokeFake answers DELETE per token: tok-a with statusA, the other token
+// with statusB; it records "<token> <path>" per request.
+func revokeFake(t *testing.T, statusA, statusB int) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("PRIVATE-TOKEN")
+		mu.Lock()
+		seen = append(seen, token+" "+r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		if token == "tok-a" {
+			w.WriteHeader(statusA)
+			return
+		}
+		w.WriteHeader(statusB)
+	}))
+	t.Cleanup(fake.Close)
+	return fake, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return seen
+	}
+}
+
+func revokeWithTwoConnections(t *testing.T, base string) error {
+	t.Helper()
+	s := newServer(t, base)
+	_, err := s.RevokeRepoCredentials(t.Context(), &pb.RevokeRepoCredentialsRequest{
+		CredentialId: encodeCredentialID([]issuedToken{{ProjectID: 1, TokenID: 11}}),
+		Credentials:  []*pb.Credential{groupCredential(t, "a", "tok-a"), groupCredential(t, "g", fakeToken)}})
+	return err
+}
+
+func TestRevokeTriesNextConnectionAfter404(t *testing.T) {
+	fake, seen := revokeFake(t, http.StatusNotFound, http.StatusNoContent)
+
+	err := revokeWithTwoConnections(t, fake.URL)
+
+	want := []string{"tok-a DELETE /api/v4/projects/1/access_tokens/11", fakeToken + " DELETE /api/v4/projects/1/access_tokens/11"}
+	if err != nil || !reflect.DeepEqual(seen(), want) {
+		t.Fatalf("revoke = %v, requests %v", err, seen())
+	}
+}
+
+func TestRevokeTreats403And404AsGone(t *testing.T) {
+	fake, _ := revokeFake(t, http.StatusForbidden, http.StatusNotFound)
+
+	err := revokeWithTwoConnections(t, fake.URL)
+
+	if err != nil {
+		t.Fatalf("revoke = %v; want gone", err)
+	}
+}
+
+func TestRevokeReportsOtherFailures(t *testing.T) {
+	fake, _ := revokeFake(t, http.StatusNotFound, http.StatusInternalServerError)
+
+	err := revokeWithTwoConnections(t, fake.URL)
+
+	if status.Code(err) != codes.Unavailable || strings.Contains(err.Error(), fakeToken) {
+		t.Fatalf("revoke = %v; want Unavailable", err)
+	}
+}

@@ -13,6 +13,8 @@ import (
 
 	pb "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -33,6 +35,11 @@ func (f *fakeStream) Send(e *pb.CodeHostEvent) error {
 // returns what it sent.
 func streamCycles(t *testing.T, s *Server, repos []string, cycles int) []*pb.CodeHostEvent {
 	t.Helper()
+	return streamCyclesWith(t, s, []*pb.Credential{groupCredential(t, "g", fakeToken)}, repos, cycles)
+}
+
+func streamCyclesWith(t *testing.T, s *Server, creds []*pb.Credential, repos []string, cycles int) []*pb.CodeHostEvent {
+	t.Helper()
 	polled, ticks := make(chan struct{}), make(chan time.Time)
 	s.after = func(d time.Duration) <-chan time.Time {
 		if d != 30*time.Second {
@@ -45,7 +52,7 @@ func streamCycles(t *testing.T, s *Server, repos []string, cycles int) []*pb.Cod
 	stream := &fakeStream{ctx: ctx}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.StreamEvents(&pb.StreamCodeHostEventsRequest{Repos: repos, Credentials: []*pb.Credential{groupCredential(t, "g", fakeToken)}}, stream)
+		done <- s.StreamEvents(&pb.StreamCodeHostEventsRequest{Repos: repos, Credentials: creds}, stream)
 	}()
 	for i := range cycles {
 		<-polled
@@ -76,8 +83,9 @@ func humanNote(id int, body, updated string) string {
 	return fmt.Sprintf(`{"id":%d,"body":%q,"system":false,"updated_at":%q,"author":{"id":6,"username":"dev","name":"Dev One"}}`, id, body, updated)
 }
 
-// pollFake serves one repo g/p with the given merge requests and per-iid
-// notes, and records each request URI; other repos answer 500.
+// pollFake serves one repo g/p with the given merge requests and notes keyed
+// "<iid>" (page 1) or "<iid>/<page>", and records each request URI; other
+// repos answer 500.
 type pollFake struct {
 	*httptest.Server
 	mu   sync.Mutex
@@ -99,8 +107,11 @@ func newPollFake(t *testing.T, mrs string, notes map[string]string) *pollFake {
 		case path == prefix:
 			fmt.Fprint(w, mrs)
 		case strings.HasSuffix(path, "/notes"):
-			iid := strings.Split(strings.TrimPrefix(path, prefix+"/"), "/")[0]
-			fmt.Fprint(w, "["+notes[iid]+"]")
+			key := strings.Split(strings.TrimPrefix(path, prefix+"/"), "/")[0]
+			if page := r.URL.Query().Get("page"); page != "" && page != "1" {
+				key += "/" + page
+			}
+			fmt.Fprint(w, "["+notes[key]+"]")
 		default:
 			http.NotFound(w, r)
 		}
@@ -159,8 +170,8 @@ func TestPollEmitsMentionOnMR(t *testing.T) {
 		t.Fatalf("events = %v", events)
 	}
 	wantRequests := []string{
-		"/api/v4/projects/g%2Fp/merge_requests?per_page=100&state=opened&updated_after=2026-11-26T10%3A00%3A00Z",
-		"/api/v4/projects/g%2Fp/merge_requests/7/notes?order_by=updated_at&per_page=100&sort=asc",
+		"/api/v4/projects/g%2Fp/merge_requests?order_by=updated_at&per_page=100&state=opened&updated_after=2026-11-26T10%3A00%3A00Z",
+		"/api/v4/projects/g%2Fp/merge_requests/7/notes?order_by=updated_at&page=1&per_page=100&sort=desc",
 	}
 	if got := f.requests(); !reflect.DeepEqual(got, wantRequests) {
 		t.Fatalf("requests = %v", got)
@@ -198,5 +209,75 @@ func TestPollContinuesAfterFailingRepo(t *testing.T) {
 
 	if got := externalIDs(events); !reflect.DeepEqual(got, []string{"note:104"}) {
 		t.Fatalf("events = %v", got)
+	}
+}
+
+func notesAt(first, count int, system bool, updated string) string {
+	var out []string
+	for i := range count {
+		out = append(out, fmt.Sprintf(`{"id":%d,"body":"n","system":%v,"updated_at":%q,"author":{"id":6,"username":"dev"}}`, first+i, system, updated))
+	}
+	return strings.Join(out, ",")
+}
+
+func TestPollPagesNotesNewestFirst(t *testing.T) {
+	newer := fixedNow.Add(2 * time.Second).Format(time.RFC3339)
+	old := fixedNow.Add(-time.Hour).Format(time.RFC3339)
+	f := newPollFake(t, "["+ourMR+"]", map[string]string{
+		"7":   humanNote(1, "newest", newer) + "," + notesAt(1000, 99, true, recent),
+		"7/2": humanNote(2, "older", recent) + "," + notesAt(2000, 99, false, old),
+		"7/3": humanNote(3, "beyond the cursor page", recent),
+	})
+	s := newServer(t, f.URL)
+
+	events := streamCycles(t, s, []string{"g/p"}, 1)
+
+	if got := externalIDs(events); !reflect.DeepEqual(got, []string{"note:2", "note:1"}) {
+		t.Fatalf("events = %v", got)
+	}
+	if got := len(f.requests()); got != 3 {
+		t.Fatalf("requests = %v; want MR list and two note pages", f.requests())
+	}
+}
+
+func unauthorizedFake(t *testing.T) *httptest.Server {
+	t.Helper()
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(fake.Close)
+	return fake
+}
+
+func TestStreamEndsUnauthenticatedWithSingleConnection(t *testing.T) {
+	s := newServer(t, unauthorizedFake(t).URL)
+
+	err := s.StreamEvents(&pb.StreamCodeHostEventsRequest{Repos: []string{"g/p"},
+		Credentials: []*pb.Credential{groupCredential(t, "g", fakeToken)}}, &fakeStream{ctx: t.Context()})
+
+	if status.Code(err) != codes.Unauthenticated || strings.Contains(err.Error(), fakeToken) {
+		t.Fatalf("StreamEvents = %v; want Unauthenticated", err)
+	}
+}
+
+func TestStreamKeepsRunningOn401WithSeveralConnections(t *testing.T) {
+	s := newServer(t, unauthorizedFake(t).URL)
+	creds := []*pb.Credential{groupCredential(t, "g", fakeToken), groupCredential(t, "h", "tok-h")}
+
+	events := streamCyclesWith(t, s, creds, []string{"g/p", "h/q"}, 2)
+
+	if len(events) != 0 {
+		t.Fatalf("events = %v", events)
+	}
+}
+
+func TestStreamWithoutCoveredRepoIsFailedPrecondition(t *testing.T) {
+	s := newServer(t, "https://gitlab.example.test")
+
+	err := s.StreamEvents(&pb.StreamCodeHostEventsRequest{Repos: []string{"other/p"},
+		Credentials: []*pb.Credential{groupCredential(t, "g", fakeToken)}}, &fakeStream{ctx: t.Context()})
+
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("StreamEvents = %v; want FailedPrecondition", err)
 	}
 }

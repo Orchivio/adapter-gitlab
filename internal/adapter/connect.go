@@ -156,7 +156,7 @@ func (c *conn) resolve(ctx context.Context, path string) error {
 		ID       int64
 		FullPath string `json:"full_path"`
 	}
-	err := c.request(ctx, http.MethodGet, "/groups/"+url.PathEscape(path), nil, nil, &group)
+	err := c.request(ctx, http.MethodGet, "/groups/"+url.PathEscape(path), url.Values{"with_projects": {"false"}}, nil, &group)
 	switch {
 	case err == nil && (group.ID <= 0 || !ValidPath(group.FullPath)):
 		return status.Error(codes.Unavailable, "GitLab returned an incomplete group")

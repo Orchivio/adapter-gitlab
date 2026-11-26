@@ -26,6 +26,9 @@ func gitlabConnectFake(t *testing.T, accessLevel int) *httptest.Server {
 		case "/api/v4/user":
 			fmt.Fprint(w, `{"id":5,"username":"orchivio-bot"}`)
 		case "/api/v4/groups/g":
+			if r.URL.Query().Get("with_projects") != "false" {
+				t.Errorf("group lookup without with_projects=false: %s", r.URL.RawQuery)
+			}
 			fmt.Fprint(w, `{"id":9,"full_path":"g"}`)
 		case "/api/v4/projects/g%2Fp":
 			fmt.Fprint(w, `{"id":42,"path_with_namespace":"g/p"}`)

@@ -141,7 +141,8 @@ func (s *Server) RevokeRepoCredentials(ctx context.Context, req *pb.RevokeRepoCr
 
 // revoke deletes each token. credential_id names no path, so the matching
 // connection is not known: a project connection with that id goes first,
-// then the others; the first success wins and 404 everywhere means gone.
+// then the others; the first success wins, and 403/404 everywhere means
+// already gone or not visible to any connection.
 // ponytail: one DELETE per connection in the worst case; add the path to
 // credential_id if tenants have many connections.
 func (s *Server) revoke(ctx context.Context, conns []conn, tokens []issuedToken) error {
@@ -170,7 +171,7 @@ func revokeOne(ctx context.Context, conns []conn, token issuedToken) error {
 		switch {
 		case err == nil:
 			return nil
-		case errors.Is(err, apiError(http.StatusNotFound)):
+		case errors.Is(err, apiError(http.StatusNotFound)), errors.Is(err, apiError(http.StatusForbidden)):
 		case failure == nil:
 			failure = err
 		}
